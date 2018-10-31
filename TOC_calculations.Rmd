@@ -1,0 +1,163 @@
+---
+title: "TOC concentration calculations"
+author: "Lydia Vaughn"
+date: "September 21, 2018"
+output: html_document
+---
+
+Data: TIC_TOC_export_20180822.csv includes calibrated TIC and TOC measurements.
+
+```{r}
+toc1 <- read.csv('data/TIC_TOC_export_20180817.csv', header=T, sep=',', na.strings=c('','no data'), fill=T, quote='', stringsAsFactors=F)
+toc2 <- read.csv('data/TIC_TOC_export_20180822.csv', header=T, sep=',', na.strings=c('','no data'), fill=T, quote='', stringsAsFactors=F)
+inventory <- read.csv('data/sample_inventory.csv', header=T, sep=',', na.strings=c('','no data'), fill=T, quote='', stringsAsFactors=F)
+extraction <- read.csv('data/weoc_extraction.csv', header=T, sep=',', na.strings=c('','no data'), fill=T, quote='', stringsAsFactors=F)
+```
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(message=FALSE)
+```
+
+```{r}
+library(lubridate)
+library(tidyverse)
+```
+
+Combine data frames
+```{r}
+toc1 <- toc1 %>% mutate(run.number = 1)
+toc2 <- toc2 %>% mutate(run.number = 2)
+toc <- rbind(toc1, toc2)
+```
+
+Separate the date and time variables and format dates
+```{r}
+toc <- toc %>% separate(Date_Time, into = c("date", "time"), sep = " ") %>% mutate(date = as.POSIXct(date, format = "%m/%d/%y"))
+```
+
+Calculate the mean for each set of injections
+```{r}
+toc.long <- toc %>% filter(Anal. != "NPOC") %>% group_by(Anal., Sample.Name, run.number, Manual.Dilution) %>% summarize(mean_mg_L = mean(Calibrated)) %>% full_join(toc %>% filter(Anal. == "NPOC") %>% select(c(Anal., Sample.Name, run.number, Uncalibrated, Manual.Dilution)) %>% rename("mean_mg_L" = "Uncalibrated"))
+```
+
+Label all measurements below 1 mg/L as 0 (below detection)
+```{r}
+toc.long$final_mg_L <- ifelse(toc.long$mean_mg_L < 1, 0, toc.long$mean_mg_L)
+```
+
+Calculate TOC as TC - IC (corrected for the sample dilution during analysis)
+```{r}
+toc.wide <- toc.long %>% select(Sample.Name, Anal., run.number, final_mg_L, Manual.Dilution) %>% spread(Anal., final_mg_L) %>% mutate(TC = TC * Manual.Dilution, IC = IC * Manual.Dilution, TOC = TC - IC) 
+```
+
+Format sample identifiers to match the sample inventory sheet 
+```{r}
+toc.wide <- toc.wide %>% separate(Sample.Name, into = c("collection_date", "plot", "depth"), sep = " ") %>% separate(depth, into = c("top_depth_cm", "bottom_depth_cm"), sep = "-")
+
+toc.wide$bottom_depth_cm <- as.numeric(toc.wide$bottom_depth_cm)
+toc.wide$top_depth_cm <- as.numeric(toc.wide$top_depth_cm)
+
+toc.wide$collection_date <- ifelse(toc.wide$collection_date == "0605", "2018-06-05", toc.wide$collection_date)
+toc.wide$collection_date <- ifelse(toc.wide$collection_date == "0807", "2018-08-07", toc.wide$collection_date)
+toc.wide$collection_date <- as.Date(toc.wide$collection_date)
+
+inventory$collection_date <- as.Date(inventory$collection_date, format = "%m/%d/%y")
+extraction$collection_date <- as.Date(extraction$collection_date, format = "%m/%d/%y")
+```
+
+Add column to toc.wide for the depth increment of each sample
+```{r}
+toc.wide <- toc.wide %>% full_join(inventory %>% select(collection_date, plot, top_depth_cm, bottom_depth_cm, increment))
+```
+
+Add columns to toc.wide for the gwcand the total amounts of wet soil and solution used in the extraction
+```{r}
+toc.wide <- toc.wide %>% left_join(extraction %>% select(collection_date, plot, top_depth_cm, bottom_depth_cm, gwc_drysoil, actual_solution_mL, actual_wetsoil_g))
+```
+
+Calculate the weoc in mg per g dry soil
+```{r}
+#Calculate dry soil used in the extraction
+toc.wide <- toc.wide %>% mutate(drysoil_g = 100 * actual_wetsoil_g / (gwc_drysoil + 100), weoc_ug = TOC * actual_solution_mL, weoc_ug_g = weoc_ug / drysoil_g) 
+```
+
+Write the toc.wide data frame to a csv file
+```{r}
+write.csv(toc.wide, 'data/processed_weoc_data.csv', quote=FALSE, row.names=FALSE)
+```
+
+Summarize the mean, sd, and se for each increment and sampling date
+```{r}
+toc.summ <- toc.wide %>% group_by(collection_date, increment) %>% summarize(mean.weoc = mean(weoc_ug_g, na.rm = T), sd.weoc = sd(weoc_ug_g, na.rm = T), n.weoc = length(weoc_ug_g)) %>% mutate(se.weoc = sd.weoc / n.weoc ^ 0.5)
+```
+
+Plot the summarized data as a bar graph
+```{r}
+plottheme <- theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+  theme(axis.text = element_text(color="black", size=12)) +
+  theme(axis.title = element_text(color="black", size=14)) +
+  theme(legend.text = element_text(size=12)) +
+  theme(legend.title = element_text(size=14)) +
+  theme(plot.title = element_text(size = 14))
+
+organic <- ggplot(toc.summ %>% filter(increment == "1"), aes(y = mean.weoc, x = as.factor(collection_date))) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Organic soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+organic + plottheme
+
+shallow.mineral <- ggplot(toc.summ %>% filter(increment == "2"), aes(y = mean.weoc, x = as.factor(collection_date))) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Shallow mineral soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+shallow.mineral + plottheme
+
+deep.mineral <- ggplot(toc.summ %>% filter(increment == "3"), aes(y = mean.weoc, x = as.factor(collection_date))) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Deep mineral soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+deep.mineral + plottheme
+```
+
+Make the above plots, separated by C vs T
+```{r}
+toc.wide$CT <- sapply(strsplit(as.character(toc.wide$plot), ""), "[", 1)
+
+toc.summ.CT <- toc.wide %>% group_by(collection_date, increment, CT) %>% summarize(mean.weoc = mean(weoc_ug_g, na.rm = T), sd.weoc = sd(weoc_ug_g, na.rm = T), n.weoc = length(weoc_ug_g)) %>% mutate(se.weoc = sd.weoc / n.weoc ^ 0.5)
+
+organic.CT <- ggplot(toc.summ.CT %>% filter(increment == "1"), aes(y = mean.weoc, x = as.factor(collection_date), fill = CT)) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Organic soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+organic.CT + plottheme
+
+shallow.mineral.CT <- ggplot(toc.summ.CT %>% filter(increment == "2"), aes(y = mean.weoc, x = as.factor(collection_date), fill = CT)) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Shallow mineral soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+shallow.mineral.CT + plottheme
+
+deep.mineral.CT <- ggplot(toc.summ.CT %>% filter(increment == "3"), aes(y = mean.weoc, x = as.factor(collection_date), fill = CT)) +
+  geom_bar(stat="identity", position=position_dodge(0.8), width=0.75) +
+  geom_hline(yintercept = 0, size = 0.25) +
+  ylab(expression(WEOC~(mu*g~g^-1))) +
+  xlab("Sample collection date") +
+  ggtitle("Deep mineral soil") +
+  geom_errorbar(aes(ymin = mean.weoc - se.weoc, ymax = mean.weoc + se.weoc), position = position_dodge(0.8), width = 0.2, size = 0.4) 
+deep.mineral.CT + plottheme
+```
